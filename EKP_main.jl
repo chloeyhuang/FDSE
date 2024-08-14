@@ -1,6 +1,6 @@
 using OceanBioME, Oceananigans
 import OceanBioME: BoxModelGrid
-using OceanBioME: NPZDModel, LOBSTERModel
+using OceanBioME.Models: NPZDModel, LOBSTERModel
 using Oceananigans.Units
 using Oceananigans.Fields: FunctionField
 
@@ -18,7 +18,7 @@ using EnsembleKalmanProcesses.ParameterDistributions
 #using Peaks
 
 include("PZ.jl") # Include the functions defined in PZ.jl
-include("EKPUtils_old.jl") #Includes G function + other required 
+include("EKPUtils_fs.jl") #Includes G function + other required 
 
 year = years = 365day
 const EKP = EnsembleKalmanProcesses
@@ -40,7 +40,10 @@ prior_noise = 0.3
 observation_noise = 0.001
 priorstds = 0.3
 
-function G(times, timeseries)
+function G(model; data = nothing, Δt = 0.05, stop_time = 50.0)
+    out = RunBoxModel(model; Δt, stop_time)
+    times = out[1]
+    timeseries = out[2]
     n = length(times)
     observations = []
     #print(timeseries)
@@ -49,20 +52,65 @@ function G(times, timeseries)
         TS_min = minimum(timeseries[tracer])
         TS_rms = sqrt(1/n * sum(abs2, (timeseries[tracer].-TS_min)))
         TS_end = timeseries[tracer][end]
-        TS_start = timeseries[tracer][1]
-        push!(observations, TS_max - TS_min, TS_rms, TS_end)
+        T_max = argmax(timeseries[tracer])
+        push!(observations, TS_max - TS_min, TS_rms, TS_end, T_max)
     end
     # observations returned: end - start, rms, last point of timeseries
     #println(observations)
     return observations
 end
 
+function G_single(times, timeseries, tracer)
+    n = length(times)
+    observations = []
+    #print(timeseries)
+    TS_max = maximum(timeseries[tracer])
+    T_max = argmax(timeseries[tracer])
+    TS_min = minimum(timeseries[tracer])
+    TS_rms = sqrt(1/n * sum(abs2, (timeseries[tracer].-TS_min)))
+    TS_end = timeseries[tracer][end]
+    TS_start = timeseries[tracer][1]
+    push!(observations, TS_max - TS_min, TS_rms, TS_end, T_max)
+    # observations returned: end - start, rms, last point of timeseries
+    #println(observations)
+    return observations
+end
+G_single(times, timeseries) = G_single(times, timeseries, :P)
+
+function RunBoxModel(m; Δt = 0.05, stop_time = 50) #runs a box model; takes the model as values and returns the timeseries
+    model = m
+    output_path = pwd() * "/output/"*string(get_bgc(model)) * "_output.jld2"
+    # Runs simulation 
+    simulation = FastSimulation(model; Δt = Δt, stop_time = stop_time)
+    run!(simulation, save_interval = 1, feedback_interval = Inf, save = SaveBoxModel(output_path), verbose = false)
+    
+    # Formats and processes output
+    vars = keys(model.fields)
+    file = jldopen(output_path)
+    rounding = length(string(simulation.Δt))    
+
+    times_u = parse.(Float64, keys(file["fields"]))
+    times = [round(times_u[i]; digits = rounding) for i in 1:length(times_u)]
+
+    timeseries = NamedTuple{vars}(ntuple(t -> zeros(length(times_u)), length(vars)))
+    for (idx, time) in enumerate(times_u)
+        values = file["fields/$time"]
+        for tracer in vars
+            getproperty(timeseries, tracer)[idx] = values[tracer]
+        end
+    end
+    close(file)
+    
+    return times, timeseries
+end
+
+ 
 function generate_data(obj::EKPObject, true_params, n_samples::Int64, noise) #generates data from truth model with added noise
     @info "Generating samples..."
+    start_t = now()
 
-    G(u) = obj.observations(u)
+    G(u) = obj.observation(u)
     dim_output = length(G(true_params)) # dimension of output
-    param_names = obj.mutable_vars
 
     Γ = noise * Diagonal([1 for i in 1:dim_output])
     noise_dist = MvNormal(zeros(dim_output), Γ)
@@ -75,13 +123,11 @@ function generate_data(obj::EKPObject, true_params, n_samples::Int64, noise) #ge
             println(string("Reached ", i, " samples"))
         end
     end
-    data_names = []
-    for key in keys(obj.base_model.fields)
-        push!(data_names, String(key)*"_max")
-        push!(data_names, String(key)*"_min")
-        push!(data_names, String(key)*"_rms")
-    end
-    return Observations.Observation(yt, Γ, Vector{String}(data_names))
+
+    end_t = now()
+    println("elapsed: " * string(end_t - start_t) * "\n")
+
+    return Observations.Observation(yt, Γ, ["" for i in 1:dim_output])
 end
 
 #config for models
@@ -132,10 +178,12 @@ param_names_npzd = [
     :phyto_base_mortality_rate, 
     :maximum_grazing_rate, 
     :grazing_half_saturation, 
-    :assimulation_efficiency, 
+    :assimulation_efficiency, #restrain to be between 0 and 1
     :base_excretion_rate, 
     :zoo_base_mortality_rate, 
-    :remineralization_rate]
+    :remineralization_rate
+]
+NPZD_lims = (assimulation_efficiency = [0, 1],)
 
 #
 pz_bgc = PhytoplanktonZooplankton()
@@ -150,9 +198,10 @@ param_names_pz = [
     :light_decay_length
     ]
 #
-true_bgc = npzd_bgc 
+true_bgc = npzd_model.biogeochemistry 
 true_model = npzd_model
 param_names = param_names_npzd
+constraints = NPZD_lims
 
 param_true = values(get_params(true_bgc; params = param_names, float_only = false))
 dim_input = length(param_true) # dimension of input
@@ -163,11 +212,21 @@ prior_cov = prior_noise^2 * Diagonal([i^2 for i in param_true])
 prior_offset = MvNormal(zeros(dim_input), prior_cov)
 
  #guesses a random prior mean which is a mvn with mean true params
-prior_mean_negative = param_true .+ rand(prior_offset)
-prior_mean = [abs(prior_mean_negative[i]) for i in 1:length(prior_mean_negative)]
-prior_std = priorstds*[prior_mean[i] for i in 1:length(param_true)]
+prior_mean = param_true .+ rand(prior_offset)
 
-#println(prior_mean)
+for key in keys(constraints)
+    idx = findfirst(isequal(key), param_names)
+    val = abs(prior_mean[idx])
+    lmin = constraints[key][1]
+    lmax = constraints[key][2]
+    if val < lmin 
+        prior_mean[idx] = lmin + min(abs(lmin - val), abs((lmax - lmin)^2/(lmin-val)))
+    elseif val > lmax
+        prior_mean[idx] = lmax - min(abs(val-lmax), abs((lmax-lmin)^2/(val-lmax)))
+    end
+end
+prior_mean = [1.52051e-6, 8.61683e-6, 1.38137, 2.79668e-7,6.6611e-8,3.90374e-5, 0.439785, 0.885452,1.02191e-7, 3.38861e-6, 1.08577e-6]
+prior_std = priorstds*[prior_mean[i] for i in 1:length(param_true)]
 
 #####################
 # declare EKP object with relevant parameters
@@ -180,19 +239,27 @@ PZEKP = EKPObject(pz_model, G;
             prior_mean = prior_mean, 
             prior_std = prior_std)
 
+            
 ######
 """
-NPZDEKP = EKPObject(npzd_model, G; 
-            Δt = 30minutes, 
-            stop_time = 30000minutes, 
-            mutable_vars = param_names_npzd, 
-            iterations = 15, 
-            prior_mean = prior_mean, 
-            prior_std = prior_std)
+
+NPZDEKP = EKPObject(; 
+                model = npzd_model,
+                G = G,
+                Δt = 60minutes, 
+                stop_time = 60000minutes, 
+                mutable_vars = param_names_npzd, 
+                iterations = 12, 
+                prior_mean = prior_mean, 
+                prior_std = prior_std,
+                constraints = constraints
+)
 
 """          
 ######
-LOBSTEREKP = EKPObject(LOBSTER_model, G; 
+LOBSTEREKP = EKPObject;
+            model = LOBSTER_model, 
+            G = G,
             Δt = 30minutes, 
             stop_time = 30000minutes, 
             mutable_vars = param_names_LOBSTER, 
@@ -205,13 +272,7 @@ LOBSTEREKP = EKPObject(LOBSTER_model, G;
 function run_ekp(obj::EKPObject)
     #generate 'truth' data with noise 
     start_time = now()
-
-    start_t = now()
-
     truth = generate_data(obj, param_true, 200, observation_noise)
-
-    end_t = now()
-    println("elapsed: " * string(end_t - start_t) * "\n")
 
     ######################
 
@@ -261,4 +322,5 @@ end
 
 println("================\n")
 
-run_ekp(NPZDEKP)
+truth = generate_data(NPZDEKP, param_true, 100, observation_noise)
+result = optimise_parameters!(NPZDEKP, truth)
